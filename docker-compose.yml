@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  main-api:
+    build: .
+    container_name: financial-intelligence-api
+    ports:
+      - "6900:6900"
+    environment:
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - DEFAULT_RECIPIENTS=${DEFAULT_RECIPIENTS}
+    command: uvicorn main:app --host 0.0.0.0 --port 6900
+    restart: unless-stopped
+
+  agent-api:
+    build: .
+    container_name: smt-agent
+    ports:
+      - "6901:6901"
+    environment:
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - DEFAULT_RECIPIENTS=${DEFAULT_RECIPIENTS}
+    command: uvicorn agent:agent_app --host 0.0.0.0 --port 6901
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    container_name: smt-scheduler
+    environment:
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - DEFAULT_RECIPIENTS=${DEFAULT_RECIPIENTS}
+    command: python scheduler.py
+    restart: unless-stopped
