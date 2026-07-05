@@ -11,7 +11,8 @@ AI-powered financial analysis and market intelligence platform with SMT divergen
 - OpenBB Workspace integration with custom widgets
 
 Screenshot include: 
-<img src"Screenshot 2026-07-05 052051.png">
+<img width="1358" height="578" alt="image" src="https://github.com/user-attachments/assets/3c112206-6ae8-4748-82d3-dbe955ece14f" />
+
 
 ## Asset Coverage
 
