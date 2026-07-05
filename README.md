@@ -10,6 +10,9 @@ AI-powered financial analysis and market intelligence platform with SMT divergen
 - Email notifications for trading opportunities
 - OpenBB Workspace integration with custom widgets
 
+Screenshot include: 
+<img src"Screenshot 2026-07-05 052051.png">
+
 ## Asset Coverage
 
 | Group           | Base Asset | Correlated Assets      |
