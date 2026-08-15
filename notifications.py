@@ -8,7 +8,7 @@ import smtplib
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import asyncio
 from datetime import datetime
 import httpx
