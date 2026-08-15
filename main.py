@@ -3,17 +3,96 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
+from contextlib import asynccontextmanager
+import asyncio
 import json
+import logging
 import pandas as pd
 from pathlib import Path
 import yfinance as yf
+
+# agent_app is a *second* FastAPI app (SMT divergence detection).
+# We mount it below instead of running it as a separate process/port.
+# now_local() returns Africa/Nairobi (Kenya) time, used for every
+# timestamp shown to the user, regardless of the host server's own timezone.
+from agent import agent_app, SMTMonitor, now_local
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("scheduler")
+
+# ==========================================
+# BACKGROUND SCHEDULER (replaces scheduler.py as a separate process)
+# ==========================================
+# Free hosting tiers (e.g. Render's free web service) only run ONE
+# always-on process. Instead of a separate `python scheduler.py` process
+# looping on its own, we run the same checks as a background asyncio task
+# inside this web process, started on app startup via `lifespan` below.
+
+monitor = SMTMonitor()
+
+TIMEFRAME_MINUTES = {
+    "30m": 30,
+    "1h": 60,
+    "4h": 240,
+    "1d": 1440,
+    "1w": 10080,
+}
+
+async def background_scheduler():
+    """Runs for the lifetime of the app; checks each timeframe on its own interval."""
+    from agent import SMT_GROUPS  # module-level groups defined in agent.py
+
+    async def check_timeframe(timeframe: str):
+        results: List[Dict[str, Any]] = []
+        for group_name, group_config in SMT_GROUPS.items():
+            try:
+                found = await monitor.check_timeframe(group_name, group_config, timeframe)
+                if found:
+                    results.extend(found)
+                    logger.info(f"Found {len(found)} divergences in {group_name} on {timeframe}")
+            except Exception as e:
+                logger.error(f"Error checking {group_name} on {timeframe}: {e}")
+        if results:
+            # Email notifications are disabled — just log what was found.
+            logger.info(f"{len(results)} divergence(s) detected on {timeframe} (email notifications are disabled)")
+        return results
+
+    last_run: Dict[str, Optional[datetime]] = {tf: None for tf in TIMEFRAME_MINUTES}
+
+    logger.info("Background scheduler starting; running an initial full check...")
+    try:
+        for tf in TIMEFRAME_MINUTES:
+            await check_timeframe(tf)
+            last_run[tf] = datetime.now()
+    except Exception as e:
+        logger.error(f"Initial scheduler check failed: {e}")
+
+    logger.info("Background scheduler running (checks 30m/1h/4h/1d/1w on their own intervals).")
+    while True:
+        await asyncio.sleep(60)  # tick once a minute
+        now = datetime.now()
+        for tf, minutes in TIMEFRAME_MINUTES.items():
+            if last_run[tf] is None or (now - last_run[tf]).total_seconds() >= minutes * 60:
+                last_run[tf] = now
+                await check_timeframe(tf)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(background_scheduler())
+    yield
+    task.cancel()
 
 # Initialize FastAPI
 app = FastAPI(
     title="Financial Intelligence System",
     description="AI-powered financial analysis and market intelligence",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
+
+# The agent's own FastAPI app is now served under /agent/* instead of its
+# own port/process — e.g. /smt/detect becomes /agent/smt/detect.
+app.mount("/agent", agent_app)
 
 # Enable CORS for OpenBB Workspace
 app.add_middleware(
@@ -48,18 +127,26 @@ def get_symbol(asset: str) -> str:
     """Get Yahoo Finance symbol for an asset"""
     return ASSET_SYMBOLS.get(asset.upper(), asset)
 
-def fetch_yahoo_data(symbol: str, period: str = "5d", start: str = None, end: str = None):
-    """Safely fetch data from Yahoo Finance"""
-    try:
-        ticker = yf.Ticker(symbol)
-        if start and end:
-            data = ticker.history(start=start, end=end)
-        else:
-            data = ticker.history(period=period)
-        return data
-    except Exception as e:
-        print(f"Error fetching {symbol}: {e}")
-        return pd.DataFrame()
+async def fetch_yahoo_data(symbol: str, period: str = "5d", start: str = None, end: str = None):
+    """
+    Safely fetch data from Yahoo Finance.
+
+    yfinance makes plain (blocking) network calls under the hood. In a single
+    -process async app that matters: a blocking call freezes the *entire*
+    event loop, so every other request would stall until it finished.
+    asyncio.to_thread() runs it on a background thread instead, so the server
+    stays responsive to other requests while this one waits on the network.
+    """
+    def _fetch():
+        try:
+            ticker = yf.Ticker(symbol)
+            if start and end:
+                return ticker.history(start=start, end=end)
+            return ticker.history(period=period)
+        except Exception as e:
+            print(f"Error fetching {symbol}: {e}")
+            return pd.DataFrame()
+    return await asyncio.to_thread(_fetch)
 
 # ==========================================
 # WIDGETS CONFIGURATION ENDPOINT
@@ -132,8 +219,8 @@ async def get_widgets():
                 "category": "Commodities",
                 "gridData": {"w": 20, "h": 10},
                 "params": {
-                    "start_date": (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d"),
-                    "end_date": datetime.now().strftime("%Y-%m-%d")
+                    "start_date": (now_local() - timedelta(days=365)).strftime("%Y-%m-%d"),
+                    "end_date": now_local().strftime("%Y-%m-%d")
                 }
             },
             "all_assets": {
@@ -153,7 +240,7 @@ async def get_widgets():
 async def get_current_price() -> Dict[str, Any]:
     """Current XAUUSD Price - Returns a METRIC widget"""
     try:
-        data = fetch_yahoo_data("GC=F", period="5d")
+        data = await fetch_yahoo_data("GC=F", period="5d")
         
         if data.empty:
             return {"value": "N/A", "delta": "0%", "label": "XAUUSD (Unavailable)"}
@@ -178,7 +265,7 @@ async def get_current_price() -> Dict[str, Any]:
 async def get_silver_current() -> Dict[str, Any]:
     """Current XAGUSD Price - Returns a METRIC widget"""
     try:
-        data = fetch_yahoo_data("SI=F", period="5d")
+        data = await fetch_yahoo_data("SI=F", period="5d")
         
         if data.empty:
             return {"value": "N/A", "delta": "0%", "label": "XAGUSD (Unavailable)"}
@@ -207,7 +294,7 @@ async def get_forex_current() -> List[Dict[str, Any]]:
     
     for name, symbol in pairs.items():
         try:
-            data = fetch_yahoo_data(symbol, period="2d")
+            data = await fetch_yahoo_data(symbol, period="2d")
             if not data.empty:
                 current = float(data["Close"].iloc[-1])
                 previous = float(data["Close"].iloc[-2]) if len(data) > 1 else current
@@ -232,7 +319,7 @@ async def get_futures_data() -> List[Dict[str, Any]]:
     
     for name, symbol in futures.items():
         try:
-            data = fetch_yahoo_data(symbol, period="2d")
+            data = await fetch_yahoo_data(symbol, period="2d")
             if not data.empty:
                 current = float(data["Close"].iloc[-1])
                 previous = float(data["Close"].iloc[-2]) if len(data) > 1 else current
@@ -252,12 +339,12 @@ async def get_futures_data() -> List[Dict[str, Any]]:
 
 @app.get("/xauusd/historical")
 async def get_xauusd_historical(
-    start_date: str = Query(default=(datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")),
-    end_date: str = Query(default=datetime.now().strftime("%Y-%m-%d"))
+    start_date: str = Query(default=(now_local() - timedelta(days=365)).strftime("%Y-%m-%d")),
+    end_date: str = Query(default=now_local().strftime("%Y-%m-%d"))
 ) -> List[Dict[str, Any]]:
     """XAUUSD Historical Price Data"""
     try:
-        data = fetch_yahoo_data("GC=F", start=start_date, end=end_date)
+        data = await fetch_yahoo_data("GC=F", start=start_date, end=end_date)
         if data.empty:
             return [{"error": "No data available"}]
         
@@ -281,8 +368,8 @@ async def get_xauusd_historical(
 
 @app.get("/xauusd/correlation")
 async def get_correlation(
-    start_date: str = Query(default=(datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")),
-    end_date: str = Query(default=datetime.now().strftime("%Y-%m-%d"))
+    start_date: str = Query(default=(now_local() - timedelta(days=90)).strftime("%Y-%m-%d")),
+    end_date: str = Query(default=now_local().strftime("%Y-%m-%d"))
 ) -> List[Dict[str, Any]]:
     """Correlation Matrix"""
     assets = {"Gold": "GC=F", "Silver": "SI=F", "GBPUSD": "GBPUSD=X", "EURUSD": "EURUSD=X"}
@@ -290,7 +377,7 @@ async def get_correlation(
     
     for name, symbol in assets.items():
         try:
-            data = fetch_yahoo_data(symbol, start=start_date, end=end_date)
+            data = await fetch_yahoo_data(symbol, start=start_date, end=end_date)
             if not data.empty and "Close" in data.columns:
                 data_dict[name] = data["Close"]
         except Exception as e:
@@ -317,8 +404,8 @@ async def get_correlation(
 async def check_divergence() -> Dict[str, Any]:
     """Divergence Detection: XAUUSD vs XAGUSD"""
     try:
-        gold = fetch_yahoo_data("GC=F", period="30d")
-        silver = fetch_yahoo_data("SI=F", period="30d")
+        gold = await fetch_yahoo_data("GC=F", period="30d")
+        silver = await fetch_yahoo_data("SI=F", period="30d")
         
         if gold.empty or silver.empty:
             return {"error": "No data available", "divergence": False}
@@ -341,7 +428,7 @@ async def check_divergence() -> Dict[str, Any]:
             "divergence": divergence_detected,
             "direction": direction if divergence_detected else "none",
             "message": f"{direction.capitalize()} divergence detected!" if divergence_detected else "No divergence detected",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "timestamp": now_local().strftime("%Y-%m-%d %H:%M:%S") + " EAT"
         }
     except Exception as e:
         return {"error": str(e), "divergence": False}
@@ -350,7 +437,7 @@ async def check_divergence() -> Dict[str, Any]:
 async def get_insight() -> str:
     """AI-Generated Market Insight - Returns MARKDOWN"""
     try:
-        data = fetch_yahoo_data("GC=F", period="6mo")
+        data = await fetch_yahoo_data("GC=F", period="6mo")
         if data.empty:
             return "No data available for analysis"
         
@@ -376,7 +463,7 @@ async def get_insight() -> str:
 - **{'BULLISH' if current > avg_50d else 'BEARISH'}** short-term momentum
 - Price is **{((current - low_6m) / (high_6m - low_6m) * 100):.1f}%** of its 6-month range
 
-*Data from Yahoo Finance | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
+*Data from Yahoo Finance | {now_local().strftime('%Y-%m-%d %H:%M:%S')} EAT*
 """
     except Exception as e:
         return f"Error generating insight: {str(e)}"
@@ -395,7 +482,7 @@ async def get_all_assets() -> List[Dict[str, Any]]:
     
     for name, symbol in assets.items():
         try:
-            data = fetch_yahoo_data(symbol, period="2d")
+            data = await fetch_yahoo_data(symbol, period="2d")
             if not data.empty:
                 current = float(data["Close"].iloc[-1])
                 previous = float(data["Close"].iloc[-2]) if len(data) > 1 else current
