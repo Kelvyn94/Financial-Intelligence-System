@@ -65,5 +65,85 @@
     "endpoint": "assets/all",
     "category": "Dashboard",
     "gridData": { "w": 20, "h": 8 }
+  },
+  "liquidity_chart": {
+    "name": "Liquidity Map",
+    "description": "Candlestick chart with equal highs/lows, major swings, previous session H/L, and previous day/week/month H/L drawn as reference lines",
+    "type": "chart",
+    "endpoint": "agent/liquidity/chart",
+    "category": "Analysis",
+    "gridData": { "w": 40, "h": 20 },
+    "params": [
+      {
+        "type": "text",
+        "paramName": "asset",
+        "value": "XAUUSD",
+        "label": "Asset",
+        "show": true,
+        "options": [
+          { "label": "Gold (XAUUSD)", "value": "XAUUSD" },
+          { "label": "Silver (XAGUSD)", "value": "XAGUSD" },
+          { "label": "GBPUSD", "value": "GBPUSD" },
+          { "label": "EURUSD", "value": "EURUSD" },
+          { "label": "Nasdaq", "value": "NASDAQ" },
+          { "label": "S&P 500 (ES)", "value": "ES" },
+          { "label": "Dow Jones (YM)", "value": "YM" }
+        ]
+      },
+      {
+        "type": "text",
+        "paramName": "timeframe",
+        "value": "30m",
+        "label": "Timeframe",
+        "show": true,
+        "options": [
+          { "label": "30m", "value": "30m" },
+          { "label": "1h", "value": "1h" },
+          { "label": "4h", "value": "4h" },
+          { "label": "1d", "value": "1d" },
+          { "label": "1w", "value": "1w" }
+        ]
+      }
+    ]
+  },
+  "liquidity_levels": {
+    "name": "Liquidity Levels",
+    "description": "Flat table of every detected liquidity level: equal highs/lows, major swings, previous session H/L, previous day/week/month H/L",
+    "type": "table",
+    "endpoint": "agent/liquidity/levels",
+    "category": "Analysis",
+    "gridData": { "w": 20, "h": 12 },
+    "params": [
+      {
+        "type": "text",
+        "paramName": "asset",
+        "value": "XAUUSD",
+        "label": "Asset",
+        "show": true,
+        "options": [
+          { "label": "Gold (XAUUSD)", "value": "XAUUSD" },
+          { "label": "Silver (XAGUSD)", "value": "XAGUSD" },
+          { "label": "GBPUSD", "value": "GBPUSD" },
+          { "label": "EURUSD", "value": "EURUSD" },
+          { "label": "Nasdaq", "value": "NASDAQ" },
+          { "label": "S&P 500 (ES)", "value": "ES" },
+          { "label": "Dow Jones (YM)", "value": "YM" }
+        ]
+      },
+      {
+        "type": "text",
+        "paramName": "timeframe",
+        "value": "30m",
+        "label": "Timeframe",
+        "show": true,
+        "options": [
+          { "label": "30m", "value": "30m" },
+          { "label": "1h", "value": "1h" },
+          { "label": "4h", "value": "4h" },
+          { "label": "1d", "value": "1d" },
+          { "label": "1w", "value": "1w" }
+        ]
+      }
+    ]
   }
 }
