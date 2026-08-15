@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Any, Optional
 import httpx
 import pandas as pd
@@ -15,8 +16,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Import notification functions
-from notifications import send_notification, send_bulk_notification
+# Email notifications are disabled (see SMTMonitor.send_alerts below);
+# no import from notifications.py needed here anymore.
+
+# All timestamps shown to the user (API responses, logs) use Kenya time,
+# regardless of what timezone the host server itself runs in (Render runs UTC).
+NAIROBI_TZ = ZoneInfo("Africa/Nairobi")
+
+def now_local() -> datetime:
+    """Current time in Africa/Nairobi (EAT, UTC+3)."""
+    return datetime.now(NAIROBI_TZ)
 
 # Configure logging
 logging.basicConfig(
@@ -101,26 +110,31 @@ INTERVAL_MAP = {
 # DATA FETCHING FUNCTIONS
 # ==========================================
 
-def fetch_asset_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+async def fetch_asset_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
     """
-    Fetch historical data for an asset using yfinance
-    
+    Fetch historical data for an asset using yfinance.
+
+    yfinance's calls are blocking (plain network I/O), so this runs them on
+    a background thread via asyncio.to_thread(). Without that, one blocking
+    call would freeze the whole app's event loop — every other request would
+    stall until this one finished.
+
     Args:
         symbol: Yahoo Finance symbol
         period: Period to fetch (e.g., '5d', '6mo')
         interval: Data interval (e.g., '30m', '60m', '1d')
-    
+
     Returns:
         DataFrame with OHLCV data
     """
-    try:
+    def _fetch():
         ticker = yf.Ticker(symbol)
         data = ticker.history(period=period, interval=interval)
-        
+
         if data.empty:
             logger.warning(f"No data for {symbol} with period={period}, interval={interval}")
             return pd.DataFrame()
-        
+
         # Resample to 4h if needed
         if interval == "1h" and period == "5d":
             # Resample 1h data to 4h
@@ -131,8 +145,11 @@ def fetch_asset_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
                 'Close': 'last',
                 'Volume': 'sum'
             }).dropna()
-        
+
         return data
+
+    try:
+        return await asyncio.to_thread(_fetch)
     except Exception as e:
         logger.error(f"Error fetching {symbol}: {e}")
         return pd.DataFrame()
@@ -245,13 +262,13 @@ class SMTMonitor:
         interval = INTERVAL_MAP.get(timeframe, "30m")
         
         # Fetch base asset data
-        base_data = fetch_asset_data(base_symbol, period, interval)
+        base_data = await fetch_asset_data(base_symbol, period, interval)
         if base_data.empty:
             return results
         
         # Check against each correlated asset
         for i, corr_symbol in enumerate(correlated_symbols):
-            corr_data = fetch_asset_data(corr_symbol, period, interval)
+            corr_data = await fetch_asset_data(corr_symbol, period, interval)
             if corr_data.empty:
                 continue
             
@@ -275,7 +292,7 @@ class SMTMonitor:
                     "change2": divergence.get("change2", 0),
                     "price1": divergence.get("price1", 0),
                     "price2": divergence.get("price2", 0),
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": now_local().isoformat()
                 })
         
         return results
@@ -298,7 +315,7 @@ class SMTMonitor:
                 except Exception as e:
                     logger.error(f"Error checking {group_name} on {timeframe}: {e}")
         
-        self.last_check = datetime.now()
+        self.last_check = now_local()
         
         # Send notifications for any detections
         if all_results:
@@ -312,48 +329,13 @@ class SMTMonitor:
     
     async def send_alerts(self, detections: List[Dict]):
         """
-        Send email notifications for detections
+        Email notifications are disabled — this just logs what would have
+        been sent. See notifications.py if you want to re-enable email later.
         """
         if not detections:
             return
-        
-        # Group by timeframe for better readability
-        by_timeframe = {}
-        for d in detections:
-            tf = d.get("timeframe", "unknown")
-            if tf not in by_timeframe:
-                by_timeframe[tf] = []
-            by_timeframe[tf].append(d)
-        
-        # Build email content
-        subject = f"SMT Alert: {len(detections)} divergence(s) detected"
-        
-        body = "SMT Divergence Detection Report\n"
-        body += "=" * 50 + "\n\n"
-        
-        for timeframe, items in by_timeframe.items():
-            body += f"📊 {timeframe.upper()} TIMEFRAME\n"
-            body += "-" * 30 + "\n"
-            
-            for item in items:
-                body += f"  • {item['group'].upper()}: {item['base']} vs {item['correlated']}\n"
-                body += f"    Type: {item['type'].upper()} divergence\n"
-                body += f"    {item['base']} change: {item.get('change1', 0):+.2f}%\n"
-                body += f"    {item['correlated']} change: {item.get('change2', 0):+.2f}%\n"
-                body += f"    Message: {item.get('message', '')}\n\n"
-        
-        body += f"\n---\nChecked at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        
-        # Send email notification
-        try:
-            await send_notification(
-                subject=subject,
-                body=body,
-                recipients=["admin@example.com"]  # Configure as needed
-            )
-            logger.info(f"Sent alert email for {len(detections)} detections")
-        except Exception as e:
-            logger.error(f"Failed to send email alert: {e}")
+
+        logger.info(f"{len(detections)} divergence(s) detected (email notifications are disabled)")
 
 # ==========================================
 # FASTAPI ENDPOINTS
@@ -408,7 +390,7 @@ async def detect_smt(
         "timeframes": timeframes_to_check,
         "detections": all_results,
         "total": len(all_results),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": now_local().isoformat()
     }
 
 @agent_app.get("/smt/status")
