@@ -200,7 +200,7 @@ def detect_smt_divergence(data1: pd.DataFrame, data2: pd.DataFrame,
         rsi2 = calculate_rsi(data2['Close'].values)
         
         rsi_divergence = False
-        if rsi1 and rsi2:
+        if rsi1 is not None and rsi2 is not None:
             if (data1['Close'].iloc[-1] > data1['Close'].iloc[-5] and 
                 rsi1[-1] < rsi1[-5] and
                 data2['Close'].iloc[-1] < data2['Close'].iloc[-5] and
