@@ -15,7 +15,7 @@ import yfinance as yf
 # We mount it below instead of running it as a separate process/port.
 # now_local() returns Africa/Nairobi (Kenya) time, used for every
 # timestamp shown to the user, regardless of the host server's own timezone.
-from agent import agent_app, SMTMonitor, now_local
+from agent import agent_app, SMTMonitor, now_local, detect_smt_divergence
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("scheduler")
@@ -402,22 +402,29 @@ async def get_correlation(
 
 @app.get("/xauusd/divergence")
 async def check_divergence() -> Dict[str, Any]:
-    """Divergence Detection: XAUUSD vs XAGUSD"""
+    """
+    SMT Divergence Detection: XAUUSD vs XAGUSD
+
+    Uses the same real ICT SMT logic as the /agent endpoints (see
+    agent.detect_smt_divergence): swing-high/swing-low non-confirmation
+    between the two correlated assets, not an arbitrary % threshold.
+    """
     try:
         gold = await fetch_yahoo_data("GC=F", period="30d")
         silver = await fetch_yahoo_data("SI=F", period="30d")
-        
+
         if gold.empty or silver.empty:
             return {"error": "No data available", "divergence": False}
-        
-        price_gold = float(gold["Close"].iloc[-1])
-        price_silver = float(silver["Close"].iloc[-1])
-        gold_change = ((price_gold - float(gold["Close"].iloc[-5])) / float(gold["Close"].iloc[-5])) * 100 if len(gold) >= 5 else 0
-        silver_change = ((price_silver - float(silver["Close"].iloc[-5])) / float(silver["Close"].iloc[-5])) * 100 if len(silver) >= 5 else 0
-        
-        divergence_detected = abs(gold_change - silver_change) > 2
-        direction = "bullish" if gold_change > silver_change else "bearish"
-        
+
+        result = detect_smt_divergence(gold, silver, "1d")
+
+        price_gold = result.get("price1", float(gold["Close"].iloc[-1]))
+        price_silver = result.get("price2", float(silver["Close"].iloc[-1]))
+        gold_change = result.get("change1", 0.0)
+        silver_change = result.get("change2", 0.0)
+        divergence_detected = result.get("divergence", False)
+        direction = result.get("type", "none")
+
         return {
             "asset1": "XAUUSD (Gold)",
             "asset2": "XAGUSD (Silver)",
@@ -426,8 +433,8 @@ async def check_divergence() -> Dict[str, Any]:
             "gold_change": f"{gold_change:+.2f}%",
             "silver_change": f"{silver_change:+.2f}%",
             "divergence": divergence_detected,
-            "direction": direction if divergence_detected else "none",
-            "message": f"{direction.capitalize()} divergence detected!" if divergence_detected else "No divergence detected",
+            "direction": direction,
+            "message": result.get("message", "No SMT divergence"),
             "timestamp": now_local().strftime("%Y-%m-%d %H:%M:%S") + " EAT"
         }
     except Exception as e:
