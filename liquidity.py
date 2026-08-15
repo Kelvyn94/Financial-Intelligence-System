@@ -18,12 +18,14 @@ duplicating them.
 """
 
 import asyncio
+import json as _json
 import logging
 from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import plotly.graph_objects as go
 import yfinance as yf
 
 from agent import (
@@ -66,6 +68,14 @@ LIQUIDITY_SYMBOLS: Dict[str, str] = {
 
 def _resolve_symbol(asset: str) -> Optional[str]:
     return LIQUIDITY_SYMBOLS.get(asset.upper())
+
+
+SESSION_LABELS: Dict[str, str] = {
+    "asia": "Asia",
+    "london": "London",
+    "new_york": "New York",
+    "new_york_pm": "New York PM",
+}
 
 
 # ==========================================
@@ -273,22 +283,13 @@ def find_major_swings(data: pd.DataFrame, lookback: int) -> Dict[str, List[Dict[
 # ENDPOINTS
 # ==========================================
 
-async def _detect_liquidity_for_asset(
-    asset: str, timeframe: str, tolerance_pct: float, major_lookback: int
+def _compute_liquidity(
+    intraday: pd.DataFrame, daily: pd.DataFrame, tolerance_pct: float, major_lookback: int
 ) -> Dict[str, Any]:
-    symbol = _resolve_symbol(asset)
-    if not symbol:
-        return {"error": f"Unknown asset '{asset}'. Available: {list(LIQUIDITY_SYMBOLS.keys())}"}
-
-    period = PERIOD_MAP.get(timeframe, "5d")
-    interval = INTERVAL_MAP.get(timeframe, "30m")
-
-    intraday = await fetch_asset_data(symbol, period, interval)
-    daily = await fetch_daily_history(symbol, period="1y")
-
-    if intraday.empty:
-        return {"error": f"No {timeframe} data available for {asset}", "asset": asset}
-
+    """Pure computation over already-fetched data -- shared by the JSON
+    endpoints and the chart builder so both read off the *same* intraday
+    dataframe (and therefore the same bar indices/timestamps) rather than
+    each triggering their own network fetch, which could drift by a bar."""
     reference_ny = now_local().astimezone(NY_TZ)
 
     swing_highs, swing_lows = find_swing_points(intraday, lookback=2)
@@ -300,17 +301,47 @@ async def _detect_liquidity_for_asset(
     dwm = previous_day_week_month(daily, reference_ny)
 
     return {
+        "equal_highs": equal_highs,
+        "equal_lows": equal_lows,
+        **major,
+        "previous_session": sessions,
+        **dwm,
+    }
+
+
+async def _fetch_liquidity_inputs(asset: str, timeframe: str) -> Tuple[Optional[str], pd.DataFrame, pd.DataFrame]:
+    """Resolve the asset and fetch both the intraday and daily series once.
+    Returns (symbol_or_None, intraday, daily); symbol is None for an
+    unrecognized asset, intraday is empty if no data came back."""
+    symbol = _resolve_symbol(asset)
+    if not symbol:
+        return None, pd.DataFrame(), pd.DataFrame()
+
+    period = PERIOD_MAP.get(timeframe, "5d")
+    interval = INTERVAL_MAP.get(timeframe, "30m")
+
+    intraday = await fetch_asset_data(symbol, period, interval)
+    daily = await fetch_daily_history(symbol, period="1y")
+    return symbol, intraday, daily
+
+
+async def _detect_liquidity_for_asset(
+    asset: str, timeframe: str, tolerance_pct: float, major_lookback: int
+) -> Dict[str, Any]:
+    symbol, intraday, daily = await _fetch_liquidity_inputs(asset, timeframe)
+    if not symbol:
+        return {"error": f"Unknown asset '{asset}'. Available: {list(LIQUIDITY_SYMBOLS.keys())}"}
+    if intraday.empty:
+        return {"error": f"No {timeframe} data available for {asset}", "asset": asset}
+
+    liquidity = _compute_liquidity(intraday, daily, tolerance_pct, major_lookback)
+
+    return {
         "asset": asset,
         "symbol": symbol,
         "timeframe": timeframe,
         "timestamp": now_local().isoformat(),
-        "liquidity": {
-            "equal_highs": equal_highs,
-            "equal_lows": equal_lows,
-            **major,
-            "previous_session": sessions,
-            **dwm,
-        },
+        "liquidity": liquidity,
     }
 
 
@@ -349,3 +380,266 @@ async def detect_liquidity_all(
     for asset in LIQUIDITY_SYMBOLS:
         results[asset] = await _detect_liquidity_for_asset(asset, timeframe, tolerance_pct, major_lookback)
     return {"timeframe": timeframe, "timestamp": now_local().isoformat(), "assets": results}
+
+
+# ==========================================
+# TABLE PRESENTATION (flat rows, for an OpenBB Workspace TABLE widget)
+# ==========================================
+
+_DWM_LABELS: Dict[str, str] = {
+    "previous_day": "Previous Day",
+    "previous_week": "Previous Week",
+    "previous_month": "Previous Month",
+}
+
+
+def _flatten_liquidity_levels(asset: str, timeframe: str, liq: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Turn the nested /liquidity/detect payload into flat rows -- one per
+    level -- sorted highest price first, so a table reads like a price
+    ladder: what's above, what's below, and by how much."""
+    rows: List[Dict[str, Any]] = []
+
+    for pool in liq["equal_highs"]:
+        rows.append({
+            "asset": asset, "timeframe": timeframe,
+            "category": "Equal Highs/Lows", "label": "Equal High",
+            "side": "high", "price": pool["price"],
+            "detail": f"{pool['touches']} touches, {pool['price_range'][0]}-{pool['price_range'][1]}",
+        })
+    for pool in liq["equal_lows"]:
+        rows.append({
+            "asset": asset, "timeframe": timeframe,
+            "category": "Equal Highs/Lows", "label": "Equal Low",
+            "side": "low", "price": pool["price"],
+            "detail": f"{pool['touches']} touches, {pool['price_range'][0]}-{pool['price_range'][1]}",
+        })
+
+    for point in liq["major_swing_highs"]:
+        rows.append({
+            "asset": asset, "timeframe": timeframe,
+            "category": "Major Swings", "label": "Major Swing High",
+            "side": "high", "price": point["price"], "detail": point["time"] or "",
+        })
+    for point in liq["major_swing_lows"]:
+        rows.append({
+            "asset": asset, "timeframe": timeframe,
+            "category": "Major Swings", "label": "Major Swing Low",
+            "side": "low", "price": point["price"], "detail": point["time"] or "",
+        })
+
+    for key, session in liq["previous_session"].items():
+        if not session:
+            continue
+        label = SESSION_LABELS.get(key, key)
+        for side in ("high", "low"):
+            rows.append({
+                "asset": asset, "timeframe": timeframe,
+                "category": "Previous Session H/L", "label": f"{label} {side.title()}",
+                "side": side, "price": session[side],
+                "detail": f"{session['session_start']} to {session['session_end']}",
+            })
+
+    for key, dwm_label in _DWM_LABELS.items():
+        bar = liq.get(key)
+        if not bar:
+            continue
+        for side in ("high", "low"):
+            rows.append({
+                "asset": asset, "timeframe": timeframe,
+                "category": "Previous Day/Week/Month H/L", "label": f"{dwm_label} {side.title()}",
+                "side": side, "price": bar[side],
+                "detail": f"period starting {bar['period_start']}",
+            })
+
+    rows.sort(key=lambda r: r["price"], reverse=True)
+    return rows
+
+
+@agent_app.get("/liquidity/levels")
+async def liquidity_levels_table(
+    asset: str = "XAUUSD",
+    timeframe: str = "30m",
+    tolerance_pct: float = 0.05,
+    major_lookback: int = 6,
+) -> List[Dict[str, Any]]:
+    """
+    Flat table of every detected liquidity level for one asset: category,
+    label, side (high/low), price, and a human-readable detail column. Built
+    for an OpenBB Workspace TABLE widget, but useful as plain tabular JSON
+    for any consumer.
+    """
+    result = await _detect_liquidity_for_asset(asset, timeframe, tolerance_pct, major_lookback)
+    if "error" in result:
+        return [{"error": result["error"]}]
+    return _flatten_liquidity_levels(asset, timeframe, result["liquidity"])
+
+
+# ==========================================
+# CHART PRESENTATION (Plotly figure, for an OpenBB Workspace CHART widget)
+# ==========================================
+#
+# Colors below are the validated dark-mode categorical hues from the
+# dataviz skill's reference palette (references/palette.md), restricted to
+# the first three slots -- the only set that clears the palette's all-pairs
+# CVD gate in both light and dark mode. A 4th hue (yellow, next to orange)
+# fails that gate, so "previous session" and "previous day/week/month" share
+# one hue (aqua) and are told apart by line dash + an always-visible direct
+# label instead of a dedicated color -- identity never rests on color alone.
+COLOR_EQUAL = "#3987e5"   # blue   -- equal highs/lows (repeated-swing pools)
+COLOR_MAJOR = "#d95926"   # orange -- major swing highs/lows
+COLOR_RANGE = "#199e70"   # aqua   -- previous session H/L + previous D/W/M H/L
+COLOR_UP = "#0ca30c"      # status "good"     -- bullish candle
+COLOR_DOWN = "#d03b3b"    # status "critical" -- bearish candle
+
+CHART_BG = "#1a1a19"      # dark chart surface (palette.md) -- OpenBB Workspace
+GRID_COLOR = "#2c2c2a"    # dark-mode gridline
+INK_PRIMARY = "#ffffff"   # dark-mode primary ink (title)
+INK_SECONDARY = "#c3c2b7"  # dark-mode secondary ink (legend/hover text)
+INK_MUTED = "#898781"     # dark-mode muted ink (axis ticks)
+
+
+# A chart reads as clutter past a handful of lines per family -- so unlike
+# /liquidity/detect and /liquidity/levels (which return everything found),
+# the chart keeps only the most relevant few per category: highest-touch
+# equal-level pools, and the most recent major swings. Nothing is silently
+# lost -- the fuller lists stay one call away via /liquidity/levels.
+MAX_EQUAL_LINES_PER_SIDE = 3
+MAX_MAJOR_LINES_PER_SIDE = 3
+
+
+def _level_trace(x0: str, x1: str, price: float, color: str, dash: str,
+                  legendgroup: str, legend_label: str, hover_label: str,
+                  show_legend: bool) -> "go.Scatter":
+    """One horizontal reference line running from where the level was set
+    (x0) to the right edge of the visible chart (x1) -- it reads as "this
+    liquidity has been resting here since x0," matching how ICT-style
+    charting tools draw these levels."""
+    return go.Scatter(
+        x=[x0, x1],
+        y=[price, price],
+        mode="lines",
+        line=dict(color=color, width=2, dash=dash),
+        legendgroup=legendgroup,
+        name=legend_label,
+        showlegend=show_legend,
+        hovertemplate=f"{hover_label}: %{{y:.5f}}<extra></extra>",
+    )
+
+
+async def _build_liquidity_chart(
+    asset: str, timeframe: str, tolerance_pct: float, major_lookback: int
+) -> Dict[str, Any]:
+    symbol, candles, daily = await _fetch_liquidity_inputs(asset, timeframe)
+    if not symbol:
+        return {"error": f"Unknown asset '{asset}'. Available: {list(LIQUIDITY_SYMBOLS.keys())}"}
+    if candles.empty:
+        return {"error": f"No {timeframe} data available for {asset}"}
+
+    liq = _compute_liquidity(candles, daily, tolerance_pct, major_lookback)
+    idx = candles.index
+    chart_start, chart_end = idx[0].isoformat(), idx[-1].isoformat()
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=idx, open=candles["Open"], high=candles["High"],
+        low=candles["Low"], close=candles["Close"],
+        increasing_line_color=COLOR_UP, decreasing_line_color=COLOR_DOWN,
+        increasing_fillcolor=COLOR_UP, decreasing_fillcolor=COLOR_DOWN,
+        name=asset, showlegend=False,
+    ))
+
+    # Equal highs/lows: keep the highest-touch pools (already sorted
+    # touches-descending by find_equal_levels); anchor each line at its
+    # most recent touch, since that's when the pool was last reinforced.
+    eq_shown = False
+    for pool in (liq["equal_highs"][:MAX_EQUAL_LINES_PER_SIDE]
+                 + liq["equal_lows"][:MAX_EQUAL_LINES_PER_SIDE]):
+        last_touch = idx[max(pool["bar_indices"])].isoformat()
+        fig.add_trace(_level_trace(
+            last_touch, chart_end, pool["price"], COLOR_EQUAL, "solid", "equal",
+            "Equal Highs/Lows", f"Equal level ({pool['touches']} touches)", not eq_shown,
+        ))
+        eq_shown = True
+
+    # Major swings: keep the most recent few per side (find_major_swings
+    # returns them in chronological order), anchored at their own bar.
+    major_shown = False
+    for point in liq["major_swing_highs"][-MAX_MAJOR_LINES_PER_SIDE:]:
+        fig.add_trace(_level_trace(
+            point["time"] or chart_start, chart_end, point["price"], COLOR_MAJOR, "dot", "major",
+            "Major Swings", "Major swing high", not major_shown,
+        ))
+        major_shown = True
+    for point in liq["major_swing_lows"][-MAX_MAJOR_LINES_PER_SIDE:]:
+        fig.add_trace(_level_trace(
+            point["time"] or chart_start, chart_end, point["price"], COLOR_MAJOR, "dot", "major",
+            "Major Swings", "Major swing low", not major_shown,
+        ))
+        major_shown = True
+
+    # Previous session H/L and prior D/W/M H/L: anchor at when that period
+    # started (may fall before the visible window for week/month -- Plotly
+    # simply clips the line to the plot area, which is the desired look).
+    session_shown = False
+    for key, session in liq["previous_session"].items():
+        if not session:
+            continue
+        label = SESSION_LABELS.get(key, key)
+        for side in ("high", "low"):
+            fig.add_trace(_level_trace(
+                session["session_start"], chart_end, session[side], COLOR_RANGE, "dashdot", "session",
+                "Previous Session H/L", f"{label} {side}", not session_shown,
+            ))
+            session_shown = True
+
+    dwm_shown = False
+    for key, dwm_label in _DWM_LABELS.items():
+        bar = liq.get(key)
+        if not bar:
+            continue
+        for side in ("high", "low"):
+            fig.add_trace(_level_trace(
+                bar["period_start"], chart_end, bar[side], COLOR_RANGE, "longdash", "dwm",
+                "Prior Day/Week/Month H/L", f"{dwm_label} {side}", not dwm_shown,
+            ))
+            dwm_shown = True
+
+    fig.update_layout(
+        title=f"{asset} -- {timeframe} Liquidity Map",
+        paper_bgcolor=CHART_BG,
+        plot_bgcolor=CHART_BG,
+        font=dict(color=INK_SECONDARY),
+        title_font=dict(color=INK_PRIMARY),
+        # Pin the visible x-range to the candles themselves. Session/D-W-M
+        # lines are anchored at their true (often much earlier) start so
+        # they read as "resting since x" on hover, but letting THAT drive
+        # autorange would squeeze the actual price action into a sliver --
+        # Plotly still clips those lines cleanly at this fixed left edge.
+        xaxis=dict(gridcolor=GRID_COLOR, rangeslider=dict(visible=False),
+                    color=INK_MUTED, range=[chart_start, chart_end]),
+        yaxis=dict(gridcolor=GRID_COLOR, color=INK_MUTED),
+        legend=dict(orientation="h", y=1.05, bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=40, r=40, t=60, b=40),
+    )
+
+    return _json.loads(fig.to_json())
+
+
+@agent_app.get("/liquidity/chart")
+async def liquidity_chart(
+    asset: str = "XAUUSD",
+    timeframe: str = "30m",
+    tolerance_pct: float = 0.05,
+    major_lookback: int = 6,
+) -> Dict[str, Any]:
+    """
+    Candlestick chart with liquidity levels drawn as horizontal reference
+    lines: the top equal highs/lows pools by touch count, the most recent
+    major swings, previous session H/L, and previous day/week/month H/L.
+    Levels are capped per category so the chart stays readable -- use
+    /liquidity/levels or /liquidity/detect for the complete, uncapped list.
+    Returns a full Plotly figure as JSON, the format an OpenBB Workspace
+    CHART widget expects
+    (docs.openbb.co/workspace/developers/widget-types/plotly-charts).
+    """
+    return await _build_liquidity_chart(asset, timeframe, tolerance_pct, major_lookback)
