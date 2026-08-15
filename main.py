@@ -17,6 +17,11 @@ import yfinance as yf
 # timestamp shown to the user, regardless of the host server's own timezone.
 from agent import agent_app, SMTMonitor, now_local, detect_smt_divergence
 
+# Importing this registers the /liquidity/* routes onto agent_app (see
+# liquidity.py) -- it's a side-effecting import, not unused. Those routes
+# then ride along wherever agent_app is mounted below (/agent/liquidity/*).
+import liquidity  # noqa: F401
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("scheduler")
 
